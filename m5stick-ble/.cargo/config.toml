@@ -1,0 +1,19 @@
+[build]
+# Uncomment the relevant target for your chip here (ESP32, ESP32-S2, ESP32-S3 or ESP32-C3)
+target = "xtensa-esp32-espidf"
+
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+runner = "espflash --monitor"
+rustflags = ["-C", "default-linker-libraries"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+#build-std-features = ["panic_immediate_abort"] # Required for older ESP-IDF versions without a realpath implementation
+
+[env]
+# Note: these variables are not used when using pio builder (`cargo build --features pio`)
+# Builds against ESP-IDF stable (v4.4)
+ESP_IDF_VERSION = "release/v4.4"
+# Builds against ESP-IDF master (mainline)
+#ESP_IDF_VERSION = "master"
