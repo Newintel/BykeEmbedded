@@ -1,5 +1,4 @@
 use std::{
-    any::Any,
     cell::RefCell,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
@@ -7,18 +6,15 @@ use std::{
 use embedded_graphics::{
     mono_font::{
         ascii::{FONT_10X20, FONT_6X13},
-        iso_8859_10::FONT_6X13_BOLD,
         MonoFont, MonoTextStyle,
     },
     pixelcolor::Rgb565,
-    prelude::{DrawTarget, Point, RgbColor, Size, WebColors},
-    primitives::{Primitive, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
+    prelude::{DrawTarget, Point, RgbColor, Size},
+    primitives::{Primitive, PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Text},
     Drawable,
 };
-use profont::{PROFONT_24_POINT, PROFONT_7_POINT};
-
-use crate::goto_screen;
+use profont::PROFONT_24_POINT;
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
@@ -37,7 +33,7 @@ pub enum TextSize {
 }
 
 impl TextSize {
-    fn get_font(&self) -> &'static MonoFont<'static> {
+    pub fn get_font(&self) -> &'static MonoFont<'static> {
         match self {
             TextSize::Small => &FONT_6X13,
             TextSize::Medium => &FONT_10X20,
@@ -175,6 +171,7 @@ pub struct Screen {
     callbacks: Callbacks,
     boxes: Vec<GraphicBox>,
     state: Arc<Mutex<RefCell<State>>>,
+    force_redraw: bool,
 }
 
 type Callback = dyn Fn(bool, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static;
@@ -202,6 +199,7 @@ impl Screen {
             callbacks: Callbacks::default(),
             boxes: vec![],
             state,
+            force_redraw: false,
         }
     }
 
@@ -269,16 +267,21 @@ impl Screen {
         self
     }
 
+    pub fn force_redraw(&mut self) {
+        self.force_redraw = true;
+    }
+
     pub fn draw<D>(&mut self, driver: &mut D)
     where
         D: DrawTarget<Color = Rgb565>,
         <D as DrawTarget>::Error: std::fmt::Debug,
     {
         for box_ in self.boxes.iter_mut() {
-            if box_.must_draw {
+            if box_.must_draw || self.force_redraw {
                 box_.draw(driver);
             }
         }
+        self.force_redraw = false;
     }
 }
 

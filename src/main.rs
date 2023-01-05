@@ -6,18 +6,18 @@ use std::cell::RefCell;
 
 // TODO: Implement an easier borrow for Mutex<RefCell<Option<T>>>
 use critical_section::Mutex;
+
 use esp_idf_hal::{
     delay::FreeRtos,
     gpio::{Gpio37, Gpio38, Gpio39, Input, InterruptType, PinDriver},
-    i2c::I2cDriver,
     prelude::Peripherals,
 };
 use esp_idf_sys as _;
 use heapless::Vec;
 use m5_go::M5Go;
 use qrcode::draw_qrcode;
-use screen::{MainState, ScreenId, Screens};
-use shared::{Commands, Coordinates};
+use screen::{ScreenId, Screens};
+use shared::Commands;
 
 use crate::screen::Button;
 
@@ -70,27 +70,49 @@ fn main() -> anyhow::Result<()> {
 
     let mut qr_code_drawn = false;
 
+    let mut stick_mac = (String::new(), false);
+
     loop {
         let mut buffer = [0u8; 256];
         if m5.port_a.read(STICK, &mut buffer, 100).is_ok() {
             let command = Commands::parse(&buffer).unwrap_or_default();
-            println!("received command: {:?}", command);
+            match command {
+                Commands::Mac(mac) => {
+                    stick_mac.0 = mac;
+                }
+                _ => {}
+            }
         }
         critical_section::with(|cs| {
             APP.borrow(cs).borrow_mut().as_mut().and_then(|app| {
                 let (screen, id) = app.get_screen();
-                if true {
-                    screen.draw(&mut m5.screen.driver);
+                screen.draw(&mut m5.screen.driver);
 
-                    if id == ScreenId::QrCode {
-                        if qr_code_drawn == false {
-                            draw_qrcode(&mut m5.screen.driver, m5.mac.as_str(), 200, 2);
-                            qr_code_drawn = true;
+                if id == ScreenId::QrCode {
+                    if qr_code_drawn == false {
+                        if stick_mac.0.is_empty() {
+                            if stick_mac.1 == true {
+                                return Some(());
+                            }
+                            CTS.borrow_ref_mut(cs)
+                                .push(Commands::GetMac)
+                                .ok()
+                                .and_then(|_| {
+                                    stick_mac.1 = true;
+                                    Some(())
+                                })
+                                .or_else(|| {
+                                    esp_println::println!("CTS is full");
+                                    Some(())
+                                });
                         }
-                    } else {
-                        qr_code_drawn = false;
+                        draw_qrcode(&mut m5.screen.driver, m5.mac.as_str(), 200, 2);
+                        qr_code_drawn = true;
                     }
+                } else {
+                    qr_code_drawn = false;
                 }
+
                 Some(())
             });
 

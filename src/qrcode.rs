@@ -4,7 +4,6 @@ use embedded_graphics::{
     prelude::{DrawTarget, Point},
     Drawable,
 };
-use m5_go::M5Go;
 use qrcode_generator::{to_image, QrCodeEcc};
 
 pub fn draw_qrcode<D>(driver: &mut D, text: &str, size: usize, coeff: usize)
