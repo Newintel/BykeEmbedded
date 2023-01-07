@@ -9,3 +9,5 @@ edition = "2021"
 serde_json = "1.0.70"
 serde = { version = "1.0.152", features = ["derive"], default-features = false }
 anyhow = "1.0.51"
+embedded-graphics = "0.7.1"
+profont = "0.6.1"

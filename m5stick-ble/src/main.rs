@@ -1,10 +1,10 @@
 use esp_idf_hal::{
     delay::FreeRtos,
     gpio::PinDriver,
-    i2c::{I2cConfig, I2cDriver, I2cSlaveConfig, I2cSlaveDriver},
+    i2c::{I2cSlaveConfig, I2cSlaveDriver},
     prelude::Peripherals,
 };
-use esp_idf_sys as _; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
+use esp_idf_sys as _;
 
 use std::{
     cell::RefCell,
@@ -25,15 +25,16 @@ use esp_idf_sys::*;
 
 use log::{info, warn};
 
-use shared::Commands;
+use shared::{Commands, TextSize};
 
-fn get_mac(mac: [u8; 6]) -> String {
+fn get_bluetooth_mac(mac: [u8; 6]) -> String {
     let mut mac_str = String::new();
     for (i, byte) in mac.iter().enumerate() {
         if i > 0 {
             mac_str.push(':');
         }
-        mac_str.push_str(&format!("{:02X}", byte));
+        let byte = if i == 5 { *byte + 2 } else { *byte };
+        mac_str.push_str(&format!("{:02X}", &byte));
     }
     mac_str
 }
@@ -44,9 +45,14 @@ fn main() -> anyhow::Result<()> {
     esp_idf_sys::link_patches();
     let netif_stack = Arc::new(EspNetif::new(NetifStack::Sta).expect("Unable to init Netif Stack"));
 
-    let mac = get_mac(netif_stack.get_mac().expect("Unable to get MAC address"));
+    let mac = get_bluetooth_mac(netif_stack.get_mac().expect("Unable to get MAC address"));
+    println!("MAC: {}", mac);
 
     let peripherals = Peripherals::take().unwrap();
+
+    let mut led = PinDriver::output(peripherals.pins.gpio10)?;
+
+    // I2C
 
     let sda = peripherals.pins.gpio32;
     let scl = peripherals.pins.gpio33;
@@ -182,19 +188,49 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
+    let full_data = RefCell::new(Vec::<u8>::new());
+
     ble.register_write_handler(char_attr_handle, move |gatts_if, write| {
         if let GattServiceEvent::Write(write) = write {
+            info!("Write event: {:?}", write.len);
             if write.is_prep {
                 warn!("Unsupported write");
             } else {
-                let value = unsafe { std::slice::from_raw_parts(write.value, write.len as usize) };
+                let mut data = full_data.borrow_mut();
+                let mut value =
+                    unsafe { std::slice::from_raw_parts(write.value, write.len as usize) };
+
+                let mut d: Vec<u8> = Vec::new();
+                if data.is_empty() == false {
+                    data.extend_from_slice(value);
+                    if write.len == 20 && data.len() < *data.get(1).unwrap() as usize {
+                        return;
+                    }
+
+                    d.clone_from(&data);
+
+                    value = d.as_slice();
+                }
+
                 let back = Commands::parse(value)
                     .ok()
-                    .and_then(|command| {
+                    .and_then(|(command, len)| {
+                        if len > 20 && data.is_empty() {
+                            data.extend_from_slice(value);
+                            return None;
+                        }
+                        info!("Received Command: {:?}", command);
                         commands_to_send.try_lock().ok().and_then(|commands| {
                             commands.borrow_mut().insert(0, command);
+                            data.clear();
                             Some(Commands::OK)
                         })
+                    })
+                    .or_else(|| {
+                        if write.len != 20 {
+                            data.clear();
+                        }
+                        None
                     })
                     .unwrap_or_default();
 
@@ -247,11 +283,19 @@ fn main() -> anyhow::Result<()> {
     })
     .expect("Failed to configure advertising data");
 
-    ble.start_advertise(|_| {
-        info!("advertising started");
-    })?;
+    start_ble(&mut ble);
+
+    let mut t = 0;
 
     loop {
+        if t == 0 {
+            led.set_high()?;
+        } else if t == 2 {
+            led.set_low()?;
+        }
+        t += 1;
+        t %= 4;
+
         cts.try_lock()
             .ok()
             .and_then(|commands| commands.borrow_mut().pop())
@@ -260,7 +304,7 @@ fn main() -> anyhow::Result<()> {
         if driver.read(&mut buffer, 50).is_ok() {
             Commands::parse(&buffer)
                 .ok()
-                .and_then(|command| {
+                .and_then(|(command, _)| {
                     println!("Command: {:?}", command);
                     match command {
                         Commands::GetMac => {
@@ -270,6 +314,9 @@ fn main() -> anyhow::Result<()> {
                                     100,
                                 )
                                 .ok();
+                        }
+                        Commands::StartBle => {
+                            start_ble(&mut ble);
                         }
                         _ => {}
                     }
@@ -283,4 +330,15 @@ fn main() -> anyhow::Result<()> {
 
         FreeRtos::delay_ms(50);
     }
+}
+
+fn start_ble(ble: &mut EspBle) {
+    ble.start_advertise(|_| {
+        info!("advertising started");
+    })
+    .ok()
+    .or_else(|| {
+        info!("Unable to start advertising");
+        Some(())
+    });
 }

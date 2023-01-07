@@ -14,7 +14,9 @@ use embedded_graphics::{
     text::{Alignment, Text},
     Drawable,
 };
-use profont::PROFONT_24_POINT;
+use shared::{Commands, TextSize};
+
+use crate::CTS;
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
@@ -24,22 +26,6 @@ pub enum Button {
     A = 1,
     B,
     C,
-}
-
-pub enum TextSize {
-    Small,
-    Medium,
-    Large,
-}
-
-impl TextSize {
-    pub fn get_font(&self) -> &'static MonoFont<'static> {
-        match self {
-            TextSize::Small => &FONT_6X13,
-            TextSize::Medium => &FONT_10X20,
-            TextSize::Large => &PROFONT_24_POINT,
-        }
-    }
 }
 
 pub struct GraphicBox {
@@ -382,13 +368,19 @@ impl Screens {
             );
 
         let qr_code_screen = Screen::new(Arc::clone(&self.state))
-            .display_button(Button::A, false)
+            .with_btn_text(Button::A, "Relancer BLE")
             .display_button(Button::B, false)
             .with_btn_text(Button::C, "Retour")
             .on(Button::C, |pushed, boxes, state| {
                 if pushed == false {
                     boxes.into_iter().for_each(|box_| box_.must_draw = true);
                     state.current_screen = ScreenId::Main;
+                }
+            })
+            .on(Button::A, |pushed, boxes, state| {
+                if pushed == false {
+                    critical_section::with(|cs| CTS.borrow_ref_mut(cs).push(Commands::StartBle))
+                        .unwrap();
                 }
             });
 

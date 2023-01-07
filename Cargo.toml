@@ -30,7 +30,6 @@ esp-idf-sys = { version = "0.32.1", features = ["binstart", "std"] }
 esp-println = "0.3.1"
 m5-go = { git = "https://github.com/Newintel/M5-go" }
 nmea-parser = "0.10.0"
-profont = "0.6.1"
 qrcode-generator = "4.1.7"
 heapless = "0.7.3"
 shared = { path = "shared" }

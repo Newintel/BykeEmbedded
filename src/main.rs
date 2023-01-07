@@ -75,7 +75,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         let mut buffer = [0u8; 256];
         if m5.port_a.read(STICK, &mut buffer, 100).is_ok() {
-            let command = Commands::parse(&buffer).unwrap_or_default();
+            let (command, _) = Commands::parse(&buffer).unwrap_or_default();
             match command {
                 Commands::Mac(mac) => {
                     stick_mac.0 = mac;
@@ -91,22 +91,22 @@ fn main() -> anyhow::Result<()> {
                 if id == ScreenId::QrCode {
                     if qr_code_drawn == false {
                         if stick_mac.0.is_empty() {
-                            if stick_mac.1 == true {
-                                return Some(());
+                            if stick_mac.1 == false {
+                                CTS.borrow_ref_mut(cs)
+                                    .push(Commands::GetMac)
+                                    .ok()
+                                    .and_then(|_| {
+                                        stick_mac.1 = true;
+                                        Some(())
+                                    })
+                                    .or_else(|| {
+                                        esp_println::println!("CTS is full");
+                                        Some(())
+                                    });
                             }
-                            CTS.borrow_ref_mut(cs)
-                                .push(Commands::GetMac)
-                                .ok()
-                                .and_then(|_| {
-                                    stick_mac.1 = true;
-                                    Some(())
-                                })
-                                .or_else(|| {
-                                    esp_println::println!("CTS is full");
-                                    Some(())
-                                });
+                            return Some(());
                         }
-                        draw_qrcode(&mut m5.screen.driver, m5.mac.as_str(), 200, 2);
+                        draw_qrcode(&mut m5.screen.driver, stick_mac.0.as_str(), 200, 2);
                         qr_code_drawn = true;
                     }
                 } else {
@@ -138,15 +138,6 @@ fn on_push_a() {
                 app.get_screen().0.call(Button::A, btn.is_low());
                 Some(())
             });
-            if btn.is_low() {
-                CTS.borrow_ref_mut(cs)
-                    .push(Commands::GetMac)
-                    .ok()
-                    .or_else(|| {
-                        esp_println::println!("CTS is full");
-                        Some(())
-                    });
-            }
             Some(())
         });
     });
