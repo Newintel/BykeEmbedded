@@ -14,6 +14,12 @@ pub struct Coordinates {
     pub long: f64,
 }
 
+impl Coordinates {
+    pub fn new(lat: f64, long: f64) -> Self {
+        Coordinates { lat, long }
+    }
+}
+
 #[derive(Debug)]
 pub enum Commands {
     NONE,

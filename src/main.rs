@@ -34,6 +34,8 @@ static CTS: Mutex<RefCell<Vec<Commands, 20>>> = Mutex::new(RefCell::new(Vec::new
 
 static APP: Mutex<RefCell<Option<Screens>>> = Mutex::new(RefCell::new(None));
 
+// TODO: Same for GPS
+
 const STICK: u8 = 0x16;
 
 fn main() -> anyhow::Result<()> {
@@ -74,7 +76,7 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         let mut buffer = [0u8; 256];
-        if m5.port_a.read(STICK, &mut buffer, 100).is_ok() {
+        if m5.port_a.read(STICK, &mut buffer, 50).is_ok() {
             let (command, _) = Commands::parse(&buffer).unwrap_or_default();
             match command {
                 Commands::Mac(mac) => {
@@ -86,6 +88,7 @@ fn main() -> anyhow::Result<()> {
         critical_section::with(|cs| {
             APP.borrow(cs).borrow_mut().as_mut().and_then(|app| {
                 let (screen, id) = app.get_screen();
+                screen.update();
                 screen.draw(&mut m5.screen.driver);
 
                 if id == ScreenId::QrCode {
@@ -119,7 +122,7 @@ fn main() -> anyhow::Result<()> {
             CTS.borrow_ref_mut(cs).pop().and_then(|command| {
                 println!("sending command: {:?}", command);
                 m5.port_a
-                    .write(STICK, command.get_stream().as_slice(), 100)
+                    .write(STICK, command.get_stream().as_slice(), 50)
                     .ok()
                     .or_else(|| {
                         esp_println::println!("Failed to send command");
@@ -127,7 +130,7 @@ fn main() -> anyhow::Result<()> {
                     })
             })
         });
-        FreeRtos::delay_ms(100);
+        FreeRtos::delay_ms(50);
     }
 }
 

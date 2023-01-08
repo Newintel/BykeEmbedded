@@ -14,6 +14,8 @@ use embedded_graphics::{
     text::{Alignment, Text},
     Drawable,
 };
+use esp_idf_hal::i2c::I2cDriver;
+use m5_go::M5Go;
 use shared::{Commands, TextSize};
 
 use crate::CTS;
@@ -124,10 +126,17 @@ impl GraphicBox {
                     .build(),
             )
             .draw(driver)
-            .expect("Failed to draw box");
+            .ok()
+            .or_else(|| {
+                println!("Draw rectangle failed");
+                None
+            });
 
         if self.visible {
-            text_drawable.draw(driver).expect("Draw text failed");
+            text_drawable.draw(driver).ok().or_else(|| {
+                println!("Draw text failed");
+                None
+            });
         }
         self.must_draw = false;
     }
@@ -161,12 +170,14 @@ pub struct Screen {
 }
 
 type Callback = dyn Fn(bool, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static;
+type UpdateCallback = dyn Fn(&mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static;
 
 #[derive(Default)]
 pub struct Callbacks {
     pub a: Option<Box<Callback>>,
     pub b: Option<Box<Callback>>,
     pub c: Option<Box<Callback>>,
+    pub update: Option<Box<UpdateCallback>>,
 }
 
 impl Callbacks {
@@ -176,6 +187,10 @@ impl Callbacks {
             Button::B => self.b.as_ref(),
             Button::C => self.c.as_ref(),
         }
+    }
+
+    pub fn get_update_callback(&self) -> Option<&Box<UpdateCallback>> {
+        self.update.as_ref()
     }
 }
 
@@ -230,14 +245,28 @@ impl Screen {
         self
     }
 
+    pub fn on_update<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static,
+    {
+        self.callbacks.update = Some(Box::new(f));
+        self
+    }
+
     pub fn call(&mut self, button: Button, pushed: bool) {
-        self.boxes
-            .get_mut(button as usize)
-            .and_then(|btn| Some(btn.set_filled(pushed)));
         if let Some(f) = self.callbacks.get_callback(button) {
             self.state
                 .try_lock()
                 .and_then(|mut state| Ok(f(pushed, &mut self.boxes, state.get_mut())))
+                .ok();
+        }
+    }
+
+    pub fn update(&mut self) {
+        if let Some(f) = self.callbacks.get_update_callback() {
+            self.state
+                .try_lock()
+                .and_then(|mut state| Ok(f(&mut self.boxes, state.get_mut())))
                 .ok();
         }
     }
@@ -273,7 +302,7 @@ impl Screen {
 
 pub struct Screens {
     screens: Vec<Screen>,
-    state: Arc<Mutex<RefCell<State>>>,
+    pub state: Arc<Mutex<RefCell<State>>>,
     pub on_screen: ScreenId,
 }
 
@@ -282,13 +311,29 @@ pub enum ScreenId {
     #[default]
     Main,
     QrCode,
+    Infos,
+    Options,
+}
+
+impl From<usize> for ScreenId {
+    fn from(number: usize) -> Self {
+        match number {
+            0 => Self::Main,
+            1 => Self::QrCode,
+            2 => Self::Infos,
+            3 => Self::Options,
+            _ => Self::default(),
+        }
+    }
 }
 
 impl Into<usize> for ScreenId {
     fn into(self) -> usize {
         match self {
-            ScreenId::Main => 0,
-            ScreenId::QrCode => 1,
+            Self::Main => 0,
+            Self::QrCode => 1,
+            Self::Infos => 2,
+            Self::Options => 3,
         }
     }
 }
@@ -302,7 +347,7 @@ impl Default for MainState {
     fn default() -> Self {
         Self {
             selected: 0,
-            max_selected: 0,
+            max_selected: 2,
         }
     }
 }
@@ -328,33 +373,32 @@ impl Screens {
             .with_btn_text(Button::C, "OK")
             .with_btn_text(Button::B, "Bas")
             .with_btn_text(Button::A, "Haut")
-            .display_button(Button::A, false)
             .on(Button::A, |pushed, boxes, state| {
                 if state.main.selected > 0 && pushed == false {
                     boxes
-                        .get_mut(4 + state.main.selected)
+                        .get_mut(5 + state.main.selected)
                         .and_then(|el| Some(el.replace_text(|txt| txt.replace("> ", ""))));
                     state.main.selected -= 1;
                     boxes
-                        .get_mut(4 + state.main.selected)
+                        .get_mut(5 + state.main.selected)
                         .and_then(|el| Some(el.replace_text(|txt| format!("> {}", txt))));
                 }
             })
             .on(Button::B, |pushed, boxes, state| {
                 if state.main.selected < state.main.max_selected && pushed == false {
                     boxes
-                        .get_mut(4 + state.main.selected)
+                        .get_mut(5 + state.main.selected)
                         .and_then(|el| Some(el.replace_text(|txt| txt.replace("> ", ""))));
                     state.main.selected += 1;
                     boxes
-                        .get_mut(4 + state.main.selected)
+                        .get_mut(5 + state.main.selected)
                         .and_then(|el| Some(el.replace_text(|txt| format!("> {}", txt))));
                 }
             })
             .on(Button::C, |pushed, boxes, state| {
-                if state.main.selected == 0 && pushed == false {
+                if pushed == false {
                     boxes.into_iter().for_each(|box_| box_.must_draw = true);
-                    state.current_screen = ScreenId::QrCode;
+                    state.current_screen = ScreenId::from(state.main.selected + 1);
                 }
             })
             .add_box(
@@ -364,12 +408,19 @@ impl Screens {
             )
             .add_box(
                 GraphicBox::new(Point::new(0, 50), Size::new(WIDTH, 25))
-                    .with_text("> Generate QR Code to connect via Bluetooth"),
+                    .with_text("> Connexion Bluetooth"),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(0, 75), Size::new(WIDTH, 25))
+                    .with_text("Excursion info"),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(0, 100), Size::new(WIDTH, 25)).with_text("Options"),
             );
 
         let qr_code_screen = Screen::new(Arc::clone(&self.state))
             .with_btn_text(Button::A, "Relancer BLE")
-            .display_button(Button::B, false)
+            .with_btn_text(Button::B, "Redemander QR Code")
             .with_btn_text(Button::C, "Retour")
             .on(Button::C, |pushed, boxes, state| {
                 if pushed == false {
@@ -382,10 +433,56 @@ impl Screens {
                     critical_section::with(|cs| CTS.borrow_ref_mut(cs).push(Commands::StartBle))
                         .unwrap();
                 }
-            });
+            })
+            .on(Button::B, |pushed, boxes, state| {
+                if pushed == false {
+                    boxes.last_mut().and_then(|box_| {
+                        box_.must_draw = true;
+                        Some(())
+                    });
+                    critical_section::with(|cs| CTS.borrow_ref_mut(cs).push(Commands::GetMac))
+                        .unwrap();
+                }
+            })
+            .add_box(
+                GraphicBox::new(Point::new(0, 0), Size::new(200, 200))
+                    .with_text("En attente du QR Code"),
+            );
+
+        let infos_screen = Screen::new(Arc::clone(&self.state))
+            .with_btn_text(Button::C, "Retour")
+            .with_btn_text(Button::B, "Nouvelle étape")
+            .on_update(|boxes, state| {})
+            .on(Button::C, |pushed, boxes, state| {
+                if pushed == false {
+                    boxes.into_iter().for_each(|box_| box_.must_draw = true);
+                    state.current_screen = ScreenId::Main;
+                }
+            })
+            .add_box(
+                GraphicBox::new(Point::new(0, 0), Size::new(WIDTH, 25))
+                    .with_text("Excursion info")
+                    .with_text_size(TextSize::Large),
+            );
+
+        let options_screen = Screen::new(Arc::clone(&self.state))
+            .with_btn_text(Button::C, "Retour")
+            .on(Button::C, |pushed, boxes, state| {
+                if pushed == false {
+                    boxes.into_iter().for_each(|box_| box_.must_draw = true);
+                    state.current_screen = ScreenId::Main;
+                }
+            })
+            .add_box(
+                GraphicBox::new(Point::new(0, 0), Size::new(WIDTH, 25))
+                    .with_text("Options")
+                    .with_text_size(TextSize::Large),
+            );
 
         self.screens.push(main_screen);
         self.screens.push(qr_code_screen);
+        self.screens.push(infos_screen);
+        self.screens.push(options_screen);
     }
 
     pub fn get_screen(&mut self) -> (&mut Screen, ScreenId) {

@@ -8,7 +8,7 @@ use esp_idf_sys as _;
 
 use std::{
     cell::RefCell,
-    sync::{mpsc::sync_channel, Arc, Mutex, MutexGuard, TryLockError},
+    sync::{mpsc::sync_channel, Arc, Mutex},
 };
 
 use esp_idf_ble::{
@@ -25,7 +25,7 @@ use esp_idf_sys::*;
 
 use log::{info, warn};
 
-use shared::{Commands, TextSize};
+use shared::{Commands, Coordinates};
 
 fn get_bluetooth_mac(mac: [u8; 6]) -> String {
     let mut mac_str = String::new();
@@ -66,10 +66,11 @@ fn main() -> anyhow::Result<()> {
     // BLE
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    let commands = Arc::new(Mutex::new(RefCell::new(Vec::<Commands>::new())));
-    let com = Arc::clone(&commands);
-    let commands_to_send = Arc::new(Mutex::new(RefCell::new(Vec::<Commands>::new())));
-    let cts = Arc::clone(&commands_to_send);
+    let commands_ble = Arc::new(Mutex::new(RefCell::new(Vec::<Commands>::new())));
+    let com_ble = Arc::clone(&commands_ble);
+
+    let commands_to_send_i2c = Arc::new(Mutex::new(RefCell::new(Vec::<Commands>::new())));
+    let cts_i2c = Arc::clone(&commands_to_send_i2c);
 
     #[allow(unused)]
     let sys_loop_stack = Arc::new(EspSystemEventLoop::take().expect("Unable to init sys_loop"));
@@ -168,13 +169,22 @@ fn main() -> anyhow::Result<()> {
     })
     .expect("Unable to add characteristic");
 
+    let full_read_data = RefCell::new(Vec::<Vec<u8>>::new());
     ble.register_read_handler(char_attr_handle, move |gatts_if, read| {
         if let GattServiceEvent::Read(read) = read {
-            let next_command = commands
-                .try_lock()
-                .ok()
-                .and_then(|commands| commands.borrow_mut().pop())
-                .unwrap_or_default();
+            let mut data = full_read_data.borrow_mut();
+            if data.is_empty() {
+                let next_command = commands_ble
+                    .try_lock()
+                    .ok()
+                    .and_then(|commands| commands.borrow_mut().pop())
+                    .unwrap_or_default();
+                let slice = &next_command.get_stream();
+                for i in (0..slice.len()).step_by(20) {
+                    let end = std::cmp::min(i + 20, slice.len());
+                    data.insert(0, slice[i..end].to_vec());
+                }
+            };
 
             esp_idf_ble::send(
                 gatts_if,
@@ -182,13 +192,13 @@ fn main() -> anyhow::Result<()> {
                 read.conn_id,
                 read.trans_id,
                 esp_gatt_status_t_ESP_GATT_OK,
-                next_command.get_stream().as_slice(),
+                data.pop().unwrap().as_slice(),
             )
             .expect("Unable to send read response");
         }
     });
 
-    let full_data = RefCell::new(Vec::<u8>::new());
+    let full_write_data = RefCell::new(Vec::<u8>::new());
 
     ble.register_write_handler(char_attr_handle, move |gatts_if, write| {
         if let GattServiceEvent::Write(write) = write {
@@ -196,11 +206,11 @@ fn main() -> anyhow::Result<()> {
             if write.is_prep {
                 warn!("Unsupported write");
             } else {
-                let mut data = full_data.borrow_mut();
+                let mut data = full_write_data.borrow_mut();
                 let mut value =
                     unsafe { std::slice::from_raw_parts(write.value, write.len as usize) };
 
-                let mut d: Vec<u8> = Vec::new();
+                let mut d: Vec<u8> = vec![];
                 if data.is_empty() == false {
                     data.extend_from_slice(value);
                     if write.len == 20 && data.len() < *data.get(1).unwrap() as usize {
@@ -220,7 +230,7 @@ fn main() -> anyhow::Result<()> {
                             return None;
                         }
                         info!("Received Command: {:?}", command);
-                        commands_to_send.try_lock().ok().and_then(|commands| {
+                        commands_to_send_i2c.try_lock().ok().and_then(|commands| {
                             commands.borrow_mut().insert(0, command);
                             data.clear();
                             Some(Commands::OK)
@@ -287,6 +297,13 @@ fn main() -> anyhow::Result<()> {
 
     let mut t = 0;
 
+    com_ble.try_lock().ok().and_then(|commands| {
+        commands
+            .borrow_mut()
+            .insert(0, Commands::NewStep(Coordinates::new(-5.6, 3.5)));
+        Some(())
+    });
+
     loop {
         if t == 0 {
             led.set_high()?;
@@ -296,7 +313,8 @@ fn main() -> anyhow::Result<()> {
         t += 1;
         t %= 4;
 
-        cts.try_lock()
+        cts_i2c
+            .try_lock()
             .ok()
             .and_then(|commands| commands.borrow_mut().pop())
             .and_then(|command| driver.write(command.get_stream().as_slice(), 200).ok());
@@ -305,7 +323,7 @@ fn main() -> anyhow::Result<()> {
             Commands::parse(&buffer)
                 .ok()
                 .and_then(|(command, _)| {
-                    println!("Command: {:?}", command);
+                    info!("Command: {:?}", command);
                     match command {
                         Commands::GetMac => {
                             driver
@@ -317,6 +335,12 @@ fn main() -> anyhow::Result<()> {
                         }
                         Commands::StartBle => {
                             start_ble(&mut ble);
+                        }
+                        Commands::GetNextStep => {
+                            com_ble.lock().ok().and_then(|commands| {
+                                commands.borrow_mut().push(command);
+                                Some(())
+                            });
                         }
                         _ => {}
                     }
