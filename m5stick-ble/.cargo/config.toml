@@ -4,7 +4,7 @@ target = "xtensa-esp32-espidf"
 
 [target.xtensa-esp32-espidf]
 linker = "ldproxy"
-runner = "espflash --monitor"
+runner = "espflash --monitor --speed 750000"
 rustflags = ["-C", "default-linker-libraries"]
 
 [unstable]

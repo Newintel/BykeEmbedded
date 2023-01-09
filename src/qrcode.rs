@@ -6,7 +6,7 @@ use embedded_graphics::{
 };
 use qrcode_generator::{to_image, QrCodeEcc};
 
-pub fn draw_qrcode<D>(driver: &mut D, text: &str, size: usize, coeff: usize)
+pub fn draw_qrcode<D>(driver: &mut D, text: &str, size: usize, coeff: usize, position: Point)
 where
     D: DrawTarget<Color = Rgb565>,
     <D as DrawTarget>::Error: std::fmt::Debug,
@@ -25,7 +25,7 @@ where
             }
         }
         let image_raw = ImageRawBE::<Rgb565>::new(&qr_slice, (size * coeff / 2) as u32);
-        let image = Image::new(&image_raw, Point::new(0, (coeff * line) as i32));
+        let image = Image::new(&image_raw, position + Point::new(0, (coeff * line) as i32));
         image.draw(driver).expect("Failed drawing image");
         qr_slice.clear();
         i += size * 2;

@@ -25,7 +25,7 @@ use esp_idf_sys::*;
 
 use log::{info, warn};
 
-use shared::{Commands, Coordinates};
+use shared::{BleState, Commands, Coordinates};
 
 fn get_bluetooth_mac(mac: [u8; 6]) -> String {
     let mut mac_str = String::new();
@@ -68,9 +68,15 @@ fn main() -> anyhow::Result<()> {
 
     let commands_ble = Arc::new(Mutex::new(RefCell::new(Vec::<Commands>::new())));
     let com_ble = Arc::clone(&commands_ble);
+    let com_ble2 = Arc::clone(&commands_ble);
 
     let commands_to_send_i2c = Arc::new(Mutex::new(RefCell::new(Vec::<Commands>::new())));
     let cts_i2c = Arc::clone(&commands_to_send_i2c);
+    let cts = Arc::clone(&commands_to_send_i2c);
+
+    let state = Arc::new(Mutex::new(RefCell::new(BleState::NONE)));
+    let s_connect = Arc::clone(&state);
+    let s_disconnect = Arc::clone(&state);
 
     #[allow(unused)]
     let sys_loop_stack = Arc::new(EspSystemEventLoop::take().expect("Unable to init sys_loop"));
@@ -104,10 +110,28 @@ fn main() -> anyhow::Result<()> {
 
     let (s, r) = sync_channel(1);
 
-    ble.register_connect_handler(gatts_if, |_gatts_if, connect| {
+    ble.register_connect_handler(gatts_if, move |_gatts_if, connect| {
         if let GattServiceEvent::Connect(connect) = connect {
             info!("Connect event: {:?}", connect);
+            s_connect.try_lock().ok().and_then(|state| {
+                state.replace(BleState::Connected);
+                Some(())
+            });
         }
+    });
+
+    ble.register_disconnect_handler(gatts_if, move |_gatts_if, disconnect| {
+        if let GattServiceEvent::Disconnect(disconnect) = disconnect {
+            info!("Disconnect event: {:?}", disconnect);
+        }
+        s_disconnect.try_lock().ok().and_then(|state| {
+            state.replace(BleState::Disconnected);
+            Some(())
+        });
+        com_ble2.try_lock().ok().and_then(|commands| {
+            commands.borrow_mut().insert(0, Commands::StartBle);
+            Some(())
+        });
     });
 
     ble.create_service(gatts_if, svc, move |gatts_if, create| {
@@ -293,7 +317,7 @@ fn main() -> anyhow::Result<()> {
     })
     .expect("Failed to configure advertising data");
 
-    start_ble(&mut ble);
+    start_ble(&mut ble, Arc::clone(&state));
 
     let mut t = 0;
 
@@ -334,12 +358,22 @@ fn main() -> anyhow::Result<()> {
                                 .ok();
                         }
                         Commands::StartBle => {
-                            start_ble(&mut ble);
+                            start_ble(&mut ble, Arc::clone(&state));
                         }
                         Commands::GetNextStep => {
                             com_ble.lock().ok().and_then(|commands| {
                                 commands.borrow_mut().push(command);
                                 Some(())
+                            });
+                        }
+                        Commands::GetBleState => {
+                            cts.try_lock().ok().and_then(|commands| {
+                                state.try_lock().ok().and_then(|state| {
+                                    commands
+                                        .borrow_mut()
+                                        .push(Commands::BleState(state.borrow().clone()));
+                                    Some(())
+                                })
                             });
                         }
                         _ => {}
@@ -356,9 +390,13 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn start_ble(ble: &mut EspBle) {
-    ble.start_advertise(|_| {
+fn start_ble(ble: &mut EspBle, state: Arc<Mutex<RefCell<BleState>>>) {
+    ble.start_advertise(move |_| {
         info!("advertising started");
+        state.try_lock().ok().and_then(|state| {
+            state.replace(BleState::Advertising);
+            Some(())
+        });
     })
     .ok()
     .or_else(|| {

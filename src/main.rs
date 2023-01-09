@@ -1,11 +1,12 @@
 mod gps;
 mod qrcode;
 mod screen;
+mod state;
 
 use std::cell::RefCell;
 
 // TODO: Implement an easier borrow for Mutex<RefCell<Option<T>>>
-use critical_section::Mutex;
+use critical_section::{CriticalSection, Mutex};
 
 use esp_idf_hal::{
     delay::FreeRtos,
@@ -13,10 +14,10 @@ use esp_idf_hal::{
     prelude::Peripherals,
 };
 use esp_idf_sys as _;
+use gps::GPS;
 use heapless::Vec;
 use m5_go::M5Go;
-use qrcode::draw_qrcode;
-use screen::{ScreenId, Screens};
+use screen::Screens;
 use shared::Commands;
 
 use crate::screen::Button;
@@ -33,6 +34,8 @@ static BUTTON_C: Mutex<RefCell<Option<PinDriver<'_, Gpio37, Input>>>> =
 static CTS: Mutex<RefCell<Vec<Commands, 20>>> = Mutex::new(RefCell::new(Vec::new()));
 
 static APP: Mutex<RefCell<Option<Screens>>> = Mutex::new(RefCell::new(None));
+
+static GPS: Mutex<RefCell<Option<GPS>>> = Mutex::new(RefCell::new(None));
 
 // TODO: Same for GPS
 
@@ -70,67 +73,44 @@ fn main() -> anyhow::Result<()> {
 
     m5.screen.turn_on();
 
-    let mut qr_code_drawn = false;
-
-    let mut stick_mac = (String::new(), false);
-
     loop {
         let mut buffer = [0u8; 256];
-        if m5.port_a.read(STICK, &mut buffer, 50).is_ok() {
+        let command = if m5.port_a.read(STICK, &mut buffer, 100).is_ok() {
             let (command, _) = Commands::parse(&buffer).unwrap_or_default();
             match command {
-                Commands::Mac(mac) => {
-                    stick_mac.0 = mac;
-                }
-                _ => {}
-            }
+                Commands::NONE => {}
+                _ => println!("received command : {:?}", command),
+            };
+            Some(command)
+        } else {
+            None
         }
+        .unwrap_or_default();
+
         critical_section::with(|cs| {
             APP.borrow(cs).borrow_mut().as_mut().and_then(|app| {
-                let (screen, id) = app.get_screen();
-                screen.update();
+                let screen = app.get_screen();
+                screen.update(cs, command);
                 screen.draw(&mut m5.screen.driver);
-
-                if id == ScreenId::QrCode {
-                    if qr_code_drawn == false {
-                        if stick_mac.0.is_empty() {
-                            if stick_mac.1 == false {
-                                CTS.borrow_ref_mut(cs)
-                                    .push(Commands::GetMac)
-                                    .ok()
-                                    .and_then(|_| {
-                                        stick_mac.1 = true;
-                                        Some(())
-                                    })
-                                    .or_else(|| {
-                                        esp_println::println!("CTS is full");
-                                        Some(())
-                                    });
-                            }
-                            return Some(());
-                        }
-                        draw_qrcode(&mut m5.screen.driver, stick_mac.0.as_str(), 200, 2);
-                        qr_code_drawn = true;
-                    }
-                } else {
-                    qr_code_drawn = false;
-                }
-
                 Some(())
             });
-
-            CTS.borrow_ref_mut(cs).pop().and_then(|command| {
+            let mut commands = CTS.borrow_ref_mut(cs);
+            commands.pop().and_then(|command| {
                 println!("sending command: {:?}", command);
                 m5.port_a
-                    .write(STICK, command.get_stream().as_slice(), 50)
+                    .write(STICK, command.get_stream().as_slice(), 100)
                     .ok()
                     .or_else(|| {
-                        esp_println::println!("Failed to send command");
+                        println!("Failed to send command");
+                        commands.insert(0, command).ok().or_else(|| {
+                            println!("The command failed being re-sent");
+                            None
+                        });
                         Some(())
                     })
-            })
+            });
         });
-        FreeRtos::delay_ms(50);
+        FreeRtos::delay_ms(100);
     }
 }
 
@@ -138,7 +118,7 @@ fn on_push_a() {
     critical_section::with(|cs| {
         BUTTON_A.borrow(cs).borrow().as_ref().and_then(|btn| {
             APP.borrow(cs).borrow_mut().as_mut().and_then(|app| {
-                app.get_screen().0.call(Button::A, btn.is_low());
+                app.get_screen().call(cs, Button::A, btn.is_low());
                 Some(())
             });
             Some(())
@@ -150,7 +130,7 @@ fn on_push_b() {
     critical_section::with(|cs| {
         BUTTON_B.borrow(cs).borrow().as_ref().and_then(|btn| {
             APP.borrow(cs).borrow_mut().as_mut().and_then(|app| {
-                app.get_screen().0.call(Button::B, btn.is_low());
+                app.get_screen().call(cs, Button::B, btn.is_low());
                 Some(())
             })
         });
@@ -161,18 +141,13 @@ fn on_push_c() {
     critical_section::with(|cs| {
         BUTTON_C.borrow(cs).borrow().as_ref().and_then(|btn| {
             APP.borrow(cs).borrow_mut().as_mut().and_then(|app| {
-                app.get_screen().0.call(Button::C, btn.is_low());
+                app.get_screen().call(cs, Button::C, btn.is_low());
                 Some(())
             })
         });
     });
 }
 
-fn goto_screen(id: ScreenId) {
-    critical_section::with(|cs| {
-        APP.borrow(cs).borrow_mut().as_mut().and_then(|app| {
-            app.goto_screen(id).expect("go to failed");
-            Some(())
-        })
-    });
+fn send_i2c(cs: CriticalSection, command: Commands) -> Option<()> {
+    CTS.borrow_ref_mut(cs).insert(0, command).ok()
 }

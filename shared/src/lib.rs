@@ -14,14 +14,66 @@ pub struct Coordinates {
     pub long: f64,
 }
 
+const EARTH_RADIUS: f64 = 6371.0;
+
+impl Coordinates {
+    pub fn distance(&self, other: &Coordinates) -> f64 {
+        let lat1 = self.lat.to_radians();
+        let lat2 = other.lat.to_radians();
+        let lon1 = self.long.to_radians();
+        let lon2 = other.long.to_radians();
+
+        let dlat = lat2 - lat1;
+        let dlon = lon2 - lon1;
+
+        let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+
+        EARTH_RADIUS * c
+    }
+}
+
 impl Coordinates {
     pub fn new(lat: f64, long: f64) -> Self {
         Coordinates { lat, long }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
+pub enum BleState {
+    #[default]
+    NONE,
+    Advertising,
+    Connected,
+    Disconnected,
+}
+
+impl From<u8> for BleState {
+    fn from(num: u8) -> Self {
+        match num {
+            0x00 => BleState::NONE,
+            0x01 => BleState::Advertising,
+            0x02 => BleState::Connected,
+            0x03 => BleState::Disconnected,
+            _ => BleState::NONE,
+        }
+    }
+}
+
+impl BleState {
+    fn get_code(&self) -> u8 {
+        match self {
+            BleState::NONE => 0x00,
+            BleState::Advertising => 0x01,
+            BleState::Connected => 0x02,
+            BleState::Disconnected => 0x03,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 pub enum Commands {
+    #[default]
     NONE,
     NewStep(Coordinates),
     NextStep(Coordinates),
@@ -31,12 +83,8 @@ pub enum Commands {
     OK,
     StartBle,
     StopBle,
-}
-
-impl Default for Commands {
-    fn default() -> Self {
-        Commands::NONE
-    }
+    BleState(BleState),
+    GetBleState,
 }
 
 impl From<u8> for Commands {
@@ -51,6 +99,8 @@ impl From<u8> for Commands {
             0x06 => Commands::Mac("".to_string()),
             0x07 => Commands::StartBle,
             0x08 => Commands::StopBle,
+            0x09 => Commands::BleState(BleState::NONE),
+            0x0a => Commands::GetBleState,
             _ => Commands::NONE,
         }
     }
@@ -68,24 +118,27 @@ impl Commands {
             Commands::Mac(_) => 0x06,
             Commands::StartBle => 0x07,
             Commands::StopBle => 0x08,
+            Commands::BleState(_) => 0x09,
+            Commands::GetBleState => 0x0a,
         }
     }
 
-    fn get_info(&self) -> String {
+    fn get_info(&self) -> Vec<u8> {
         match self {
             Commands::NewStep(coords) | Commands::NextStep(coords) => {
-                serde_json::to_string(&coords).unwrap()
+                serde_json::to_string(&coords).unwrap().as_bytes().to_vec()
             }
-            Commands::OK => "OK".to_string(),
-            Commands::Mac(mac) => mac.to_string(),
-            _ => "".to_string(),
+            Commands::OK => "OK".as_bytes().to_vec(),
+            Commands::Mac(mac) => mac.as_bytes().to_vec(),
+            Commands::BleState(state) => vec![state.get_code()],
+            _ => "".as_bytes().to_vec(),
         }
     }
 
     pub fn get_stream(&self) -> Vec<u8> {
-        let data = format!("{}", self.get_info());
+        let mut data = self.get_info();
         let mut stream = vec![self.get_code(), data.len() as u8];
-        stream.extend_from_slice(data.as_bytes());
+        stream.append(&mut data);
         stream
     }
 
@@ -136,6 +189,11 @@ impl Commands {
         if code == Commands::Mac(Default::default()).get_code() {
             let mac = from_utf8(data).unwrap();
             return Ok((Commands::Mac(mac.to_string()), length));
+        }
+
+        if code == Commands::BleState(Default::default()).get_code() {
+            let state = BleState::from(data[0]);
+            return Ok((Commands::BleState(state), length));
         }
 
         serde_json::from_slice::<'_, Coordinates>(data)

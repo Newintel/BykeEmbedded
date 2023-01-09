@@ -3,22 +3,19 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
+use critical_section::CriticalSection;
 use embedded_graphics::{
-    mono_font::{
-        ascii::{FONT_10X20, FONT_6X13},
-        MonoFont, MonoTextStyle,
-    },
+    mono_font::MonoTextStyle,
     pixelcolor::Rgb565,
     prelude::{DrawTarget, Point, RgbColor, Size},
     primitives::{Primitive, PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Text},
     Drawable,
 };
-use esp_idf_hal::i2c::I2cDriver;
-use m5_go::M5Go;
-use shared::{Commands, TextSize};
 
-use crate::CTS;
+use shared::{BleState, Commands, TextSize};
+
+use crate::{qrcode::draw_qrcode, send_i2c, state::State, GPS};
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
@@ -39,6 +36,23 @@ pub struct GraphicBox {
     visible: bool,
     text: String,
     text_size: TextSize,
+    qr_code: bool,
+    id: BoxId,
+}
+
+#[derive(PartialEq, Eq)]
+pub enum BoxId {
+    None,
+    ButtonA,
+    ButtonB,
+    ButtonC,
+    Id(usize),
+    StrId(String),
+}
+
+trait GetBoxId {
+    fn get_id(&self, id: BoxId) -> Option<&GraphicBox>;
+    fn get_id_mut(&mut self, id: BoxId) -> Option<&mut GraphicBox>;
 }
 
 impl GraphicBox {
@@ -52,6 +66,8 @@ impl GraphicBox {
             visible: true,
             text: String::new(),
             text_size: TextSize::Small,
+            qr_code: false,
+            id: BoxId::None,
         }
     }
 
@@ -68,6 +84,24 @@ impl GraphicBox {
     pub fn with_text_size(mut self, text_size: TextSize) -> Self {
         self.text_size = text_size;
         self
+    }
+
+    pub fn with_qr_code(mut self) -> Self {
+        self.qr_code = true;
+        self
+    }
+
+    pub fn with_id(mut self, id: BoxId) -> Self {
+        self.id = id;
+        self
+    }
+
+    pub fn draw_qr_code<D>(&mut self, driver: &mut D, text: &str, size: usize, coeff: usize)
+    where
+        D: DrawTarget<Color = Rgb565>,
+        <D as DrawTarget>::Error: std::fmt::Debug,
+    {
+        draw_qrcode(driver, text, size, coeff, self.drawable.top_left)
     }
 
     pub fn draw<D>(&mut self, driver: &mut D)
@@ -165,12 +199,23 @@ impl GraphicBox {
 pub struct Screen {
     callbacks: Callbacks,
     boxes: Vec<GraphicBox>,
-    state: Arc<Mutex<RefCell<State>>>,
-    force_redraw: bool,
+    pub state: Arc<Mutex<RefCell<State>>>,
 }
 
-type Callback = dyn Fn(bool, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static;
-type UpdateCallback = dyn Fn(&mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static;
+impl GetBoxId for Vec<GraphicBox> {
+    fn get_id(&self, id: BoxId) -> Option<&GraphicBox> {
+        self.iter().find(|box_| box_.id == id)
+    }
+
+    fn get_id_mut(&mut self, id: BoxId) -> Option<&mut GraphicBox> {
+        self.iter_mut().find(|box_| box_.id == id)
+    }
+}
+
+type Callback =
+    dyn Fn(CriticalSection, bool, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static;
+type UpdateCallback =
+    dyn Fn(CriticalSection, Commands, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static;
 
 #[derive(Default)]
 pub struct Callbacks {
@@ -200,7 +245,6 @@ impl Screen {
             callbacks: Callbacks::default(),
             boxes: vec![],
             state,
-            force_redraw: false,
         }
     }
 
@@ -209,21 +253,24 @@ impl Screen {
             .add_box(GraphicBox::new(Point::new(0, 0), Size::new(WIDTH, HEIGHT)))
             .add_box(
                 GraphicBox::new(Point::new(0, HEIGHT as i32 - 25), Size::new(WIDTH / 3, 25))
-                    .with_color(Rgb565::RED),
+                    .with_color(Rgb565::RED)
+                    .with_id(BoxId::ButtonA),
             )
             .add_box(
                 GraphicBox::new(
                     Point::new(WIDTH as i32 / 3, HEIGHT as i32 - 25),
                     Size::new(WIDTH / 3, 25),
                 )
-                .with_color(Rgb565::GREEN),
+                .with_color(Rgb565::GREEN)
+                .with_id(BoxId::ButtonB),
             )
             .add_box(
                 GraphicBox::new(
                     Point::new(WIDTH as i32 / 3 * 2, HEIGHT as i32 - 25),
                     Size::new(WIDTH / 3, 25),
                 )
-                .with_color(Rgb565::BLUE),
+                .with_color(Rgb565::BLUE)
+                .with_id(BoxId::ButtonC),
             )
     }
 
@@ -235,7 +282,7 @@ impl Screen {
 
     pub fn on<F>(mut self, button: Button, f: F) -> Self
     where
-        F: Fn(bool, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static,
+        F: Fn(CriticalSection, bool, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static,
     {
         match button {
             Button::A => self.callbacks.a = Some(Box::new(f)),
@@ -247,28 +294,36 @@ impl Screen {
 
     pub fn on_update<F>(mut self, f: F) -> Self
     where
-        F: Fn(&mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static,
+        F: Fn(CriticalSection, Commands, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static,
     {
         self.callbacks.update = Some(Box::new(f));
         self
     }
 
-    pub fn call(&mut self, button: Button, pushed: bool) {
+    pub fn call(&mut self, cs: CriticalSection, button: Button, pushed: bool) {
+        self.boxes
+            .get_mut(button as usize)
+            .unwrap()
+            .set_filled(pushed);
         if let Some(f) = self.callbacks.get_callback(button) {
             self.state
                 .try_lock()
-                .and_then(|mut state| Ok(f(pushed, &mut self.boxes, state.get_mut())))
+                .and_then(|mut state| Ok(f(cs, pushed, &mut self.boxes, state.get_mut())))
                 .ok();
         }
     }
 
-    pub fn update(&mut self) {
-        if let Some(f) = self.callbacks.get_update_callback() {
-            self.state
-                .try_lock()
-                .and_then(|mut state| Ok(f(&mut self.boxes, state.get_mut())))
-                .ok();
-        }
+    pub fn update(&mut self, cs: CriticalSection, command: Commands) {
+        self.state.try_lock().ok().and_then(|mut state| {
+            let state = state.get_mut();
+            if let Commands::BleState(s) = &command {
+                state.ble = s.clone();
+            }
+            if let Some(f) = self.callbacks.get_update_callback() {
+                f(cs, command, &mut self.boxes, state);
+            }
+            Some(())
+        });
     }
 
     pub fn add_box(mut self, box_: GraphicBox) -> Self {
@@ -282,21 +337,27 @@ impl Screen {
         self
     }
 
-    pub fn force_redraw(&mut self) {
-        self.force_redraw = true;
-    }
-
     pub fn draw<D>(&mut self, driver: &mut D)
     where
         D: DrawTarget<Color = Rgb565>,
         <D as DrawTarget>::Error: std::fmt::Debug,
     {
         for box_ in self.boxes.iter_mut() {
-            if box_.must_draw || self.force_redraw {
+            if box_.must_draw {
                 box_.draw(driver);
+                if box_.qr_code {
+                    self.state.try_lock().ok().and_then(|state| {
+                        let mut state = state.borrow_mut();
+                        let mac = String::from(state.qr.get_mac());
+                        if mac.is_empty() == false && state.qr.qr_code_drawn == false {
+                            box_.draw_qr_code(driver, mac.as_str(), 200, 2);
+                            state.qr.qr_code_drawn = true
+                        }
+                        Some(())
+                    });
+                }
             }
         }
-        self.force_redraw = false;
     }
 }
 
@@ -338,29 +399,9 @@ impl Into<usize> for ScreenId {
     }
 }
 
-pub struct MainState {
-    pub selected: usize,
-    pub max_selected: usize,
-}
-
-impl Default for MainState {
-    fn default() -> Self {
-        Self {
-            selected: 0,
-            max_selected: 2,
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct State {
-    pub main: MainState,
-    pub current_screen: ScreenId,
-}
-
 impl Screens {
     pub fn new() -> Self {
-        let state = Arc::new(Mutex::new(RefCell::new(State::default())));
+        let state = Arc::new(Mutex::new(RefCell::new(State::new())));
         Self {
             screens: vec![],
             state,
@@ -373,29 +414,29 @@ impl Screens {
             .with_btn_text(Button::C, "OK")
             .with_btn_text(Button::B, "Bas")
             .with_btn_text(Button::A, "Haut")
-            .on(Button::A, |pushed, boxes, state| {
+            .on(Button::A, |_, pushed, boxes, state| {
                 if state.main.selected > 0 && pushed == false {
                     boxes
-                        .get_mut(5 + state.main.selected)
+                        .get_id_mut(BoxId::Id(state.main.selected))
                         .and_then(|el| Some(el.replace_text(|txt| txt.replace("> ", ""))));
                     state.main.selected -= 1;
                     boxes
-                        .get_mut(5 + state.main.selected)
+                        .get_id_mut(BoxId::Id(state.main.selected))
                         .and_then(|el| Some(el.replace_text(|txt| format!("> {}", txt))));
                 }
             })
-            .on(Button::B, |pushed, boxes, state| {
+            .on(Button::B, |_, pushed, boxes, state| {
                 if state.main.selected < state.main.max_selected && pushed == false {
                     boxes
-                        .get_mut(5 + state.main.selected)
+                        .get_id_mut(BoxId::Id(state.main.selected))
                         .and_then(|el| Some(el.replace_text(|txt| txt.replace("> ", ""))));
                     state.main.selected += 1;
                     boxes
-                        .get_mut(5 + state.main.selected)
+                        .get_id_mut(BoxId::Id(state.main.selected))
                         .and_then(|el| Some(el.replace_text(|txt| format!("> {}", txt))));
                 }
             })
-            .on(Button::C, |pushed, boxes, state| {
+            .on(Button::C, |_, pushed, boxes, state| {
                 if pushed == false {
                     boxes.into_iter().for_each(|box_| box_.must_draw = true);
                     state.current_screen = ScreenId::from(state.main.selected + 1);
@@ -408,66 +449,121 @@ impl Screens {
             )
             .add_box(
                 GraphicBox::new(Point::new(0, 50), Size::new(WIDTH, 25))
-                    .with_text("> Connexion Bluetooth"),
+                    .with_text("> Connexion Bluetooth")
+                    .with_id(BoxId::Id(0)),
             )
             .add_box(
                 GraphicBox::new(Point::new(0, 75), Size::new(WIDTH, 25))
-                    .with_text("Excursion info"),
+                    .with_text("Excursion info")
+                    .with_id(BoxId::Id(1)),
             )
             .add_box(
-                GraphicBox::new(Point::new(0, 100), Size::new(WIDTH, 25)).with_text("Options"),
+                GraphicBox::new(Point::new(0, 100), Size::new(WIDTH, 25))
+                    .with_text("Options")
+                    .with_id(BoxId::Id(2)),
             );
 
         let qr_code_screen = Screen::new(Arc::clone(&self.state))
             .with_btn_text(Button::A, "Relancer BLE")
             .with_btn_text(Button::B, "Redemander QR Code")
             .with_btn_text(Button::C, "Retour")
-            .on(Button::C, |pushed, boxes, state| {
+            .on_update(|_, command, boxes, state| {
+                if state.qr.must_get_mac() {
+                    critical_section::with(|cs| {
+                        send_i2c(cs, Commands::GetMac).and_then(|_| {
+                            state.qr.mac_requested();
+                            Some(())
+                        })
+                    });
+                }
+                match command {
+                    Commands::Mac(mac) => {
+                        state.qr.set_mac(mac);
+                        boxes
+                            .get_id_mut(BoxId::StrId(String::from("qr")))
+                            .unwrap()
+                            .must_draw = true
+                    }
+                    _ => {}
+                };
+
+                boxes.get_mut(1).unwrap().set_visible(match state.ble {
+                    BleState::Disconnected => true,
+                    _ => false,
+                });
+            })
+            .on(Button::C, |_, pushed, boxes, state| {
                 if pushed == false {
                     boxes.into_iter().for_each(|box_| box_.must_draw = true);
+                    state.qr.qr_code_drawn = false;
                     state.current_screen = ScreenId::Main;
                 }
             })
-            .on(Button::A, |pushed, boxes, state| {
+            .on(Button::A, |_, pushed, _, _| {
                 if pushed == false {
-                    critical_section::with(|cs| CTS.borrow_ref_mut(cs).push(Commands::StartBle))
-                        .unwrap();
+                    critical_section::with(|cs| send_i2c(cs, Commands::StartBle)).or_else(|| {
+                        esp_println::println!("Error sending StartBle command");
+                        None
+                    });
                 }
             })
-            .on(Button::B, |pushed, boxes, state| {
+            .on(Button::B, |_, pushed, boxes, state| {
                 if pushed == false {
-                    boxes.last_mut().and_then(|box_| {
-                        box_.must_draw = true;
-                        Some(())
+                    boxes
+                        .get_id_mut(BoxId::StrId(String::from("qr")))
+                        .and_then(|box_| {
+                            state.qr.reset();
+                            box_.must_draw = true;
+                            Some(())
+                        });
+                    critical_section::with(|cs| {
+                        send_i2c(cs, Commands::GetMac)
+                            .and_then(|_| {
+                                state.qr.mac_requested();
+                                Some(())
+                            })
+                            .or_else(|| {
+                                esp_println::println!("Error sending GetMac command");
+                                None
+                            })
                     });
-                    critical_section::with(|cs| CTS.borrow_ref_mut(cs).push(Commands::GetMac))
-                        .unwrap();
                 }
             })
             .add_box(
                 GraphicBox::new(Point::new(0, 0), Size::new(200, 200))
-                    .with_text("En attente du QR Code"),
+                    .with_text("En attente du QR Code")
+                    .with_qr_code()
+                    .with_id(BoxId::StrId(String::from("qr"))),
             );
 
         let infos_screen = Screen::new(Arc::clone(&self.state))
             .with_btn_text(Button::C, "Retour")
-            .with_btn_text(Button::B, "Nouvelle étape")
-            .on_update(|boxes, state| {})
-            .on(Button::C, |pushed, boxes, state| {
+            .with_btn_text(Button::B, "Nouvelle etape")
+            .on(Button::C, |_, pushed, boxes, state| {
                 if pushed == false {
                     boxes.into_iter().for_each(|box_| box_.must_draw = true);
                     state.current_screen = ScreenId::Main;
                 }
+            })
+            .on_update(|cs, _, _, _| {
+                GPS.borrow_ref_mut(cs).as_mut().and_then(|gps| {
+                    match gps.read_line() {
+                        crate::gps::ConnectionState::Connected(_) => {}
+                        crate::gps::ConnectionState::NoConnection => {}
+                    };
+                    Some(())
+                });
             })
             .add_box(
                 GraphicBox::new(Point::new(0, 0), Size::new(WIDTH, 25))
                     .with_text("Excursion info")
                     .with_text_size(TextSize::Large),
-            );
+            )
+            .add_box(GraphicBox::new(Point::new(0, 50), Size::new(WIDTH, 25)));
 
         let options_screen = Screen::new(Arc::clone(&self.state))
             .with_btn_text(Button::C, "Retour")
-            .on(Button::C, |pushed, boxes, state| {
+            .on(Button::C, |_, pushed, boxes, state| {
                 if pushed == false {
                     boxes.into_iter().for_each(|box_| box_.must_draw = true);
                     state.current_screen = ScreenId::Main;
@@ -485,23 +581,10 @@ impl Screens {
         self.screens.push(options_screen);
     }
 
-    pub fn get_screen(&mut self) -> (&mut Screen, ScreenId) {
+    pub fn get_screen(&mut self) -> &mut Screen {
         let current_screen = self.state.lock().unwrap().borrow().current_screen;
-        (
-            self.screens
-                .get_mut(Into::<usize>::into(current_screen))
-                .unwrap(),
-            current_screen,
-        )
-    }
-
-    pub fn goto_screen(
-        &mut self,
-        screen: ScreenId,
-    ) -> Result<(), PoisonError<MutexGuard<'_, RefCell<State>>>> {
-        self.state.lock().and_then(|mut state| {
-            state.get_mut().current_screen = screen;
-            Ok(())
-        })
+        self.screens
+            .get_mut(Into::<usize>::into(current_screen))
+            .unwrap()
     }
 }
