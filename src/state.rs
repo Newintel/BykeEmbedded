@@ -1,3 +1,4 @@
+use nmea_parser::chrono::{DateTime, Utc};
 use shared::{BleState, Coordinates};
 
 use crate::screen::ScreenId;
@@ -39,42 +40,39 @@ impl QrState {
 }
 
 pub struct InfoState {
-    coords: Option<Coordinates>,
-    next_step: Option<Coordinates>,
+    pub coords: Option<Coordinates>,
+    pub closest_step: Option<Coordinates>,
+    pub time: Option<DateTime<Utc>>,
 }
 
 impl InfoState {
     pub fn new() -> Self {
         Self {
             coords: None,
-            next_step: None,
+            closest_step: None,
+            time: None,
         }
     }
+}
 
-    pub fn set_coords(&mut self, coords: Coordinates) {
-        self.coords = Some(coords);
-    }
+pub struct OptionsState {
+    pub selected: usize,
+    pub max_selected: usize,
+    pub fill_on_click: bool,
+}
 
-    pub fn set_next_step(&mut self, next_step: Coordinates) {
-        self.next_step = Some(next_step);
-    }
-
-    pub fn distance_to_next_step(&self) -> Option<f64> {
-        if let Some(coords) = &self.coords {
-            if let Some(next_step) = &self.next_step {
-                return Some(coords.distance(next_step));
-            }
-        }
-        None
-    }
+pub struct ConnectionState {
+    pub ble: BleState,
+    pub request_sent: bool,
 }
 
 pub struct State {
     pub main: MainState,
     pub qr: QrState,
     pub current_screen: ScreenId,
-    pub ble: BleState,
-    pub info: InfoState,
+    pub infos: InfoState,
+    pub options: OptionsState,
+    pub connection: ConnectionState,
 }
 
 impl State {
@@ -90,8 +88,16 @@ impl State {
                 qr_code_drawn: false,
             },
             current_screen: ScreenId::Main,
-            ble: BleState::NONE,
-            info: InfoState::new(),
+            infos: InfoState::new(),
+            options: OptionsState {
+                selected: 0,
+                max_selected: 1,
+                fill_on_click: false,
+            },
+            connection: ConnectionState {
+                ble: BleState::NONE,
+                request_sent: false,
+            },
         }
     }
 }

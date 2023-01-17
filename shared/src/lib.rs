@@ -31,6 +31,10 @@ impl Coordinates {
 
         EARTH_RADIUS * c
     }
+
+    pub fn is_valid(&self) -> bool {
+        self.lat.abs() < 90.0 && self.long.abs() < 180.0
+    }
 }
 
 impl Coordinates {
@@ -39,7 +43,7 @@ impl Coordinates {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum BleState {
     #[default]
     NONE,
@@ -76,8 +80,8 @@ pub enum Commands {
     #[default]
     NONE,
     NewStep(Coordinates),
-    NextStep(Coordinates),
-    GetNextStep,
+    ClosestStep(Coordinates),
+    GetClosestStep,
     GetMac,
     Mac(String),
     OK,
@@ -92,8 +96,8 @@ impl From<u8> for Commands {
         match code {
             0x00 => Commands::NONE,
             0x01 => Commands::NewStep(Coordinates::default()),
-            0x02 => Commands::NextStep(Coordinates::default()),
-            0x03 => Commands::GetNextStep,
+            0x02 => Commands::ClosestStep(Coordinates::default()),
+            0x03 => Commands::GetClosestStep,
             0x04 => Commands::OK,
             0x05 => Commands::GetMac,
             0x06 => Commands::Mac("".to_string()),
@@ -111,8 +115,8 @@ impl Commands {
         match self {
             Commands::NONE => 0x00,
             Commands::NewStep(_) => 0x01,
-            Commands::NextStep(_) => 0x02,
-            Commands::GetNextStep => 0x03,
+            Commands::ClosestStep(_) => 0x02,
+            Commands::GetClosestStep => 0x03,
             Commands::OK => 0x04,
             Commands::GetMac => 0x05,
             Commands::Mac(_) => 0x06,
@@ -125,7 +129,7 @@ impl Commands {
 
     fn get_info(&self) -> Vec<u8> {
         match self {
-            Commands::NewStep(coords) | Commands::NextStep(coords) => {
+            Commands::NewStep(coords) | Commands::ClosestStep(coords) => {
                 serde_json::to_string(&coords).unwrap().as_bytes().to_vec()
             }
             Commands::OK => "OK".as_bytes().to_vec(),
@@ -150,7 +154,7 @@ impl Commands {
         let command = Commands::from(code);
 
         let length = stream[1] as usize;
-        let data = if length > 2 && length + 2 <= stream.len() {
+        let data = if length + 2 <= stream.len() {
             Some(&stream[2..length + 2])
         } else {
             None
@@ -160,8 +164,8 @@ impl Commands {
             return Ok((Commands::NONE, length));
         }
 
-        if code == Commands::GetNextStep.get_code() {
-            return Ok((Commands::GetNextStep, length));
+        if code == Commands::GetClosestStep.get_code() {
+            return Ok((Commands::GetClosestStep, length));
         }
 
         if code == Commands::OK.get_code() {
@@ -178,6 +182,10 @@ impl Commands {
 
         if code == Commands::StopBle.get_code() {
             return Ok((Commands::StopBle, length));
+        }
+
+        if code == Commands::GetBleState.get_code() {
+            return Ok((Commands::GetBleState, length));
         }
 
         if data.is_none() {
@@ -201,8 +209,8 @@ impl Commands {
             .and_then(|coords| {
                 if code == Commands::NewStep(Default::default()).get_code() {
                     Some((Commands::NewStep(coords), length))
-                } else if code == Commands::NextStep(Default::default()).get_code() {
-                    Some((Commands::NextStep(coords), length))
+                } else if code == Commands::ClosestStep(Default::default()).get_code() {
+                    Some((Commands::ClosestStep(coords), length))
                 } else {
                     None
                 }

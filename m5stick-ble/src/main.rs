@@ -72,7 +72,6 @@ fn main() -> anyhow::Result<()> {
 
     let commands_to_send_i2c = Arc::new(Mutex::new(RefCell::new(Vec::<Commands>::new())));
     let cts_i2c = Arc::clone(&commands_to_send_i2c);
-    let cts = Arc::clone(&commands_to_send_i2c);
 
     let state = Arc::new(Mutex::new(RefCell::new(BleState::NONE)));
     let s_connect = Arc::clone(&state);
@@ -346,8 +345,8 @@ fn main() -> anyhow::Result<()> {
         if driver.read(&mut buffer, 50).is_ok() {
             Commands::parse(&buffer)
                 .ok()
-                .and_then(|(command, _)| {
-                    info!("Command: {:?}", command);
+                .and_then(|(command, size)| {
+                    info!("Command: {:?} - {size}", command);
                     match command {
                         Commands::GetMac => {
                             driver
@@ -360,20 +359,27 @@ fn main() -> anyhow::Result<()> {
                         Commands::StartBle => {
                             start_ble(&mut ble, Arc::clone(&state));
                         }
-                        Commands::GetNextStep => {
+                        Commands::NewStep(_) => {
                             com_ble.lock().ok().and_then(|commands| {
-                                commands.borrow_mut().push(command);
+                                commands.borrow_mut().insert(0, command);
                                 Some(())
                             });
                         }
                         Commands::GetBleState => {
-                            cts.try_lock().ok().and_then(|commands| {
-                                state.try_lock().ok().and_then(|state| {
-                                    commands
-                                        .borrow_mut()
-                                        .push(Commands::BleState(state.borrow().clone()));
-                                    Some(())
-                                })
+                            state.try_lock().ok().and_then(|state| {
+                                println!("State: {:?}", state.borrow());
+                                driver
+                                    .write(
+                                        Commands::BleState(state.borrow().clone())
+                                            .get_stream()
+                                            .as_slice(),
+                                        100,
+                                    )
+                                    .ok()
+                                    .or_else(|| {
+                                        println!("Unable to send response");
+                                        Some(0)
+                                    })
                             });
                         }
                         _ => {}

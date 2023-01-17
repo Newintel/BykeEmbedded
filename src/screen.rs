@@ -1,21 +1,23 @@
 use std::{
     cell::RefCell,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex},
 };
 
 use critical_section::CriticalSection;
 use embedded_graphics::{
     mono_font::MonoTextStyle,
     pixelcolor::Rgb565,
-    prelude::{DrawTarget, Point, RgbColor, Size},
+    prelude::{Point, RgbColor, Size},
     primitives::{Primitive, PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Text},
     Drawable,
 };
 
-use shared::{BleState, Commands, TextSize};
+use m5_go::M5GoScreenDriver;
+use nmea_parser::{chrono::NaiveTime, gnss::GgaQualityIndicator, ParsedMessage};
+use shared::{BleState, Commands, Coordinates, TextSize};
 
-use crate::{qrcode::draw_qrcode, send_i2c, state::State, GPS};
+use crate::{gps::read_gps_line, qrcode::draw_qrcode, send_i2c, state::State};
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
@@ -48,6 +50,28 @@ pub enum BoxId {
     ButtonC,
     Id(usize),
     StrId(String),
+}
+
+trait ToId<T> {
+    fn to_id(id: T) -> BoxId;
+}
+
+impl ToId<usize> for BoxId {
+    fn to_id(id: usize) -> BoxId {
+        BoxId::Id(id)
+    }
+}
+
+impl ToId<&str> for BoxId {
+    fn to_id(id: &str) -> BoxId {
+        BoxId::StrId(String::from(id))
+    }
+}
+
+macro_rules! id {
+    ($id:expr) => {
+        BoxId::to_id($id)
+    };
 }
 
 trait GetBoxId {
@@ -96,19 +120,22 @@ impl GraphicBox {
         self
     }
 
-    pub fn draw_qr_code<D>(&mut self, driver: &mut D, text: &str, size: usize, coeff: usize)
-    where
-        D: DrawTarget<Color = Rgb565>,
-        <D as DrawTarget>::Error: std::fmt::Debug,
-    {
+    pub fn with_filled(mut self, filled: bool) -> Self {
+        self.filled = filled;
+        self
+    }
+
+    pub fn draw_qr_code(
+        &mut self,
+        driver: &mut M5GoScreenDriver,
+        text: &str,
+        size: usize,
+        coeff: usize,
+    ) {
         draw_qrcode(driver, text, size, coeff, self.drawable.top_left)
     }
 
-    pub fn draw<D>(&mut self, driver: &mut D)
-    where
-        D: DrawTarget<Color = Rgb565>,
-        <D as DrawTarget>::Error: std::fmt::Debug,
-    {
+    pub fn draw(&mut self, driver: &mut M5GoScreenDriver) {
         let color = if self.filled && self.visible {
             self.color
         } else {
@@ -176,22 +203,29 @@ impl GraphicBox {
     }
 
     pub fn set_filled(&mut self, filled: bool) {
+        self.must_draw = self.filled != filled;
         self.filled = filled;
-        self.must_draw = true;
     }
 
     pub fn set_visible(&mut self, visible: bool) {
+        self.must_draw = self.visible != visible;
         self.visible = visible;
-        self.must_draw = true;
     }
 
     pub fn set_text(&mut self, text: &str) {
+        if self.text == text {
+            return;
+        }
         self.text = String::from(text);
         self.must_draw = true;
     }
 
     pub fn replace_text(&mut self, f: impl FnOnce(&str) -> String) {
-        self.text = f(self.text.as_str());
+        let text = f(self.text.as_str());
+        if self.text == text {
+            return;
+        }
+        self.text = text;
         self.must_draw = true;
     }
 }
@@ -214,8 +248,10 @@ impl GetBoxId for Vec<GraphicBox> {
 
 type Callback =
     dyn Fn(CriticalSection, bool, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static;
-type UpdateCallback =
-    dyn Fn(CriticalSection, Commands, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static;
+type UpdateCallback = dyn Fn(CriticalSection, Commands, &mut Vec<GraphicBox>, &mut State, Option<(f32, f32)>)
+    + Send
+    + Sync
+    + 'static;
 
 #[derive(Default)]
 pub struct Callbacks {
@@ -294,33 +330,44 @@ impl Screen {
 
     pub fn on_update<F>(mut self, f: F) -> Self
     where
-        F: Fn(CriticalSection, Commands, &mut Vec<GraphicBox>, &mut State) + Send + Sync + 'static,
+        F: Fn(CriticalSection, Commands, &mut Vec<GraphicBox>, &mut State, Option<(f32, f32)>)
+            + Send
+            + Sync
+            + 'static,
     {
         self.callbacks.update = Some(Box::new(f));
         self
     }
 
     pub fn call(&mut self, cs: CriticalSection, button: Button, pushed: bool) {
-        self.boxes
-            .get_mut(button as usize)
-            .unwrap()
-            .set_filled(pushed);
-        if let Some(f) = self.callbacks.get_callback(button) {
-            self.state
-                .try_lock()
-                .and_then(|mut state| Ok(f(cs, pushed, &mut self.boxes, state.get_mut())))
-                .ok();
-        }
-    }
-
-    pub fn update(&mut self, cs: CriticalSection, command: Commands) {
         self.state.try_lock().ok().and_then(|mut state| {
             let state = state.get_mut();
-            if let Commands::BleState(s) = &command {
-                state.ble = s.clone();
+            self.boxes
+                .get_mut(button as usize)
+                .unwrap()
+                .set_filled(state.options.fill_on_click && pushed);
+
+            if let Some(f) = self.callbacks.get_callback(button) {
+                f(cs, pushed, &mut self.boxes, state);
+            }
+
+            Some(())
+        });
+    }
+
+    pub fn update(
+        &mut self,
+        cs: CriticalSection,
+        command: Option<Commands>,
+        c_h: Option<(f32, f32)>,
+    ) {
+        self.state.try_lock().ok().and_then(|mut state| {
+            let state = state.get_mut();
+            if let Some(Commands::BleState(s)) = &command {
+                state.connection.ble = s.clone();
             }
             if let Some(f) = self.callbacks.get_update_callback() {
-                f(cs, command, &mut self.boxes, state);
+                f(cs, command.unwrap_or_default(), &mut self.boxes, state, c_h);
             }
             Some(())
         });
@@ -337,11 +384,7 @@ impl Screen {
         self
     }
 
-    pub fn draw<D>(&mut self, driver: &mut D)
-    where
-        D: DrawTarget<Color = Rgb565>,
-        <D as DrawTarget>::Error: std::fmt::Debug,
-    {
+    pub fn draw(&mut self, driver: &mut M5GoScreenDriver) {
         for box_ in self.boxes.iter_mut() {
             if box_.must_draw {
                 box_.draw(driver);
@@ -361,7 +404,7 @@ impl Screen {
     }
 }
 
-pub struct Screens {
+pub struct App {
     screens: Vec<Screen>,
     pub state: Arc<Mutex<RefCell<State>>>,
     pub on_screen: ScreenId,
@@ -399,7 +442,7 @@ impl Into<usize> for ScreenId {
     }
 }
 
-impl Screens {
+impl App {
     pub fn new() -> Self {
         let state = Arc::new(Mutex::new(RefCell::new(State::new())));
         Self {
@@ -417,22 +460,22 @@ impl Screens {
             .on(Button::A, |_, pushed, boxes, state| {
                 if state.main.selected > 0 && pushed == false {
                     boxes
-                        .get_id_mut(BoxId::Id(state.main.selected))
+                        .get_id_mut(id!(state.main.selected))
                         .and_then(|el| Some(el.replace_text(|txt| txt.replace("> ", ""))));
                     state.main.selected -= 1;
                     boxes
-                        .get_id_mut(BoxId::Id(state.main.selected))
+                        .get_id_mut(id!(state.main.selected))
                         .and_then(|el| Some(el.replace_text(|txt| format!("> {}", txt))));
                 }
             })
             .on(Button::B, |_, pushed, boxes, state| {
                 if state.main.selected < state.main.max_selected && pushed == false {
                     boxes
-                        .get_id_mut(BoxId::Id(state.main.selected))
+                        .get_id_mut(id!(state.main.selected))
                         .and_then(|el| Some(el.replace_text(|txt| txt.replace("> ", ""))));
                     state.main.selected += 1;
                     boxes
-                        .get_id_mut(BoxId::Id(state.main.selected))
+                        .get_id_mut(id!(state.main.selected))
                         .and_then(|el| Some(el.replace_text(|txt| format!("> {}", txt))));
                 }
             })
@@ -450,24 +493,24 @@ impl Screens {
             .add_box(
                 GraphicBox::new(Point::new(0, 50), Size::new(WIDTH, 25))
                     .with_text("> Connexion Bluetooth")
-                    .with_id(BoxId::Id(0)),
+                    .with_id(id!(0)),
             )
             .add_box(
                 GraphicBox::new(Point::new(0, 75), Size::new(WIDTH, 25))
                     .with_text("Excursion info")
-                    .with_id(BoxId::Id(1)),
+                    .with_id(id!(1)),
             )
             .add_box(
                 GraphicBox::new(Point::new(0, 100), Size::new(WIDTH, 25))
                     .with_text("Options")
-                    .with_id(BoxId::Id(2)),
+                    .with_id(id!(2)),
             );
 
         let qr_code_screen = Screen::new(Arc::clone(&self.state))
-            .with_btn_text(Button::A, "Relancer BLE")
-            .with_btn_text(Button::B, "Redemander QR Code")
             .with_btn_text(Button::C, "Retour")
-            .on_update(|_, command, boxes, state| {
+            .with_btn_text(Button::B, "Redemander QR Code")
+            .with_btn_text(Button::A, "Relancer BLE")
+            .on_update(|_, command, boxes, state, _| {
                 if state.qr.must_get_mac() {
                     critical_section::with(|cs| {
                         send_i2c(cs, Commands::GetMac).and_then(|_| {
@@ -479,18 +522,18 @@ impl Screens {
                 match command {
                     Commands::Mac(mac) => {
                         state.qr.set_mac(mac);
-                        boxes
-                            .get_id_mut(BoxId::StrId(String::from("qr")))
-                            .unwrap()
-                            .must_draw = true
+                        boxes.get_id_mut(id!("qr")).unwrap().must_draw = true
                     }
                     _ => {}
                 };
 
-                boxes.get_mut(1).unwrap().set_visible(match state.ble {
-                    BleState::Disconnected => true,
-                    _ => false,
-                });
+                boxes
+                    .get_id_mut(BoxId::ButtonA)
+                    .unwrap()
+                    .set_visible(match state.connection.ble {
+                        BleState::Disconnected => true,
+                        _ => false,
+                    });
             })
             .on(Button::C, |_, pushed, boxes, state| {
                 if pushed == false {
@@ -499,76 +542,382 @@ impl Screens {
                     state.current_screen = ScreenId::Main;
                 }
             })
-            .on(Button::A, |_, pushed, _, _| {
-                if pushed == false {
+            .on(Button::A, |_, pushed, _, state| {
+                if pushed == false && state.connection.ble == BleState::Disconnected {
                     critical_section::with(|cs| send_i2c(cs, Commands::StartBle)).or_else(|| {
                         esp_println::println!("Error sending StartBle command");
                         None
                     });
                 }
             })
-            .on(Button::B, |_, pushed, boxes, state| {
+            .on(Button::B, |cs, pushed, boxes, state| {
                 if pushed == false {
-                    boxes
-                        .get_id_mut(BoxId::StrId(String::from("qr")))
-                        .and_then(|box_| {
-                            state.qr.reset();
-                            box_.must_draw = true;
-                            Some(())
-                        });
-                    critical_section::with(|cs| {
-                        send_i2c(cs, Commands::GetMac)
-                            .and_then(|_| {
-                                state.qr.mac_requested();
-                                Some(())
-                            })
-                            .or_else(|| {
-                                esp_println::println!("Error sending GetMac command");
-                                None
-                            })
+                    boxes.get_id_mut(id!("qr")).and_then(|box_| {
+                        state.qr.reset();
+                        box_.must_draw = true;
+                        Some(())
                     });
+                    send_i2c(cs, Commands::GetMac)
+                        .and_then(|_| {
+                            state.qr.mac_requested();
+                            Some(())
+                        })
+                        .or_else(|| {
+                            esp_println::println!("Error sending GetMac command");
+                            None
+                        });
                 }
             })
             .add_box(
                 GraphicBox::new(Point::new(0, 0), Size::new(200, 200))
                     .with_text("En attente du QR Code")
                     .with_qr_code()
-                    .with_id(BoxId::StrId(String::from("qr"))),
+                    .with_id(id!("qr")),
             );
 
         let infos_screen = Screen::new(Arc::clone(&self.state))
             .with_btn_text(Button::C, "Retour")
             .with_btn_text(Button::B, "Nouvelle etape")
+            .with_btn_text(Button::A, "Check connection")
+            .on(Button::A, |cs, pushed, _, state| {
+                if pushed == false {
+                    match state.connection.ble {
+                        BleState::Connected | BleState::Advertising => {}
+                        BleState::Disconnected => {
+                            send_i2c(cs, Commands::StartBle);
+                        }
+                        BleState::NONE => {
+                            send_i2c(cs, Commands::GetBleState);
+                        }
+                        _ => {}
+                    }
+                }
+            })
             .on(Button::C, |_, pushed, boxes, state| {
                 if pushed == false {
                     boxes.into_iter().for_each(|box_| box_.must_draw = true);
                     state.current_screen = ScreenId::Main;
                 }
             })
-            .on_update(|cs, _, _, _| {
-                GPS.borrow_ref_mut(cs).as_mut().and_then(|gps| {
-                    match gps.read_line() {
-                        crate::gps::ConnectionState::Connected(_) => {}
-                        crate::gps::ConnectionState::NoConnection => {}
-                    };
-                    Some(())
-                });
+            .on(Button::B, |cs, pushed, _, state| {
+                if pushed == false {
+                    state.infos.coords.as_ref().and_then(|coords| {
+                        if coords.is_valid() {
+                            send_i2c(
+                                cs,
+                                Commands::NewStep(Coordinates::new(coords.lat, coords.long)),
+                            );
+                        }
+                        Some(())
+                    });
+                }
+            })
+            .on_update(|cs, command, boxes, state, c_h| {
+                match command {
+                    Commands::ClosestStep(coords) => {
+                        if coords.is_valid() {
+                            state.infos.closest_step = Some(coords);
+                        }
+                    }
+                    Commands::BleState(ble_state) => {
+                        let box_a = boxes.get_id_mut(BoxId::ButtonA).unwrap();
+                        match ble_state {
+                            BleState::Connected | BleState::Advertising => {
+                                box_a.set_visible(false);
+                            }
+                            BleState::Disconnected => {
+                                box_a.set_visible(true);
+                                box_a.set_text("Relancer BLE");
+                            }
+                            BleState::NONE => {
+                                box_a.set_visible(true);
+                                box_a.set_text("Check connection");
+                            }
+                            _ => {}
+                        }
+                        state.connection.ble = ble_state;
+                        state.connection.request_sent = false;
+                    }
+                    _ => {}
+                }
+                if state.connection.ble == BleState::NONE && state.connection.request_sent == false
+                {
+                    send_i2c(cs, Commands::GetBleState);
+                    state.connection.request_sent = true;
+                } else if state.connection.ble != BleState::Connected {
+                    let connection_box = boxes.get_id_mut(id!("connectionState")).unwrap();
+                    connection_box.set_visible(true);
+                    connection_box.replace_text(|text| {
+                        match state.connection.ble {
+                            BleState::Disconnected => "L'appareil BLE n'est pas connecte!",
+                            BleState::Advertising => "En attente de connexion GPS...",
+                            BleState::NONE => "L'appareil BLE est-il allume?",
+                            _ => text,
+                        }
+                        .to_string()
+                    });
+                } else {
+                    boxes
+                        .get_id_mut(id!("connectionState"))
+                        .unwrap()
+                        .set_visible(false);
+
+                    boxes
+                        .get_id_mut(BoxId::ButtonA)
+                        .unwrap()
+                        .set_text("Relancer BLE");
+
+                    boxes
+                        .get_id_mut(BoxId::ButtonB)
+                        .unwrap()
+                        .set_visible(state.infos.coords.is_none());
+                }
+
+                if let Some((temperature, humidity)) = c_h {
+                    boxes.get_id_mut(id!("temperature")).and_then(|box_| {
+                        box_.set_text(format!("Temperature: {:.0}C", temperature).as_str());
+                        Some(())
+                    });
+
+                    boxes.get_id_mut(id!("humidity")).and_then(|box_| {
+                        box_.set_text(format!("Humidite: {:.0}%", humidity).as_str());
+                        Some(())
+                    });
+                }
+
+                match read_gps_line(cs) {
+                    Some(message) => {
+                        match message {
+                            ParsedMessage::Incomplete => {}
+                            ParsedMessage::Gga(infos) => {
+                                if infos.quality != GgaQualityIndicator::Invalid {
+                                    state.infos.time = infos.timestamp;
+                                    state.infos.coords = infos.longitude.and_then(|lon| {
+                                        infos
+                                            .latitude
+                                            .and_then(|lat| Some(Coordinates::new(lat, lon)))
+                                    });
+                                }
+                                boxes.get_id_mut(id!("time")).unwrap().replace_text(|text| {
+                                    match state.infos.time {
+                                        Some(timestamp) => {
+                                            let time = timestamp
+                                                .time()
+                                                .signed_duration_since(NaiveTime::default());
+                                            format!(
+                                                "{}:{} UTC",
+                                                time.num_hours(),
+                                                time.num_minutes() - time.num_hours() * 60
+                                            )
+                                            .to_string()
+                                        }
+                                        None => text.to_string(),
+                                    }
+                                });
+
+                                boxes.get_id_mut(id!("longitude")).and_then(|box_| {
+                                    box_.replace_text(|text| {
+                                        if infos.quality != GgaQualityIndicator::Invalid {
+                                            infos.longitude.and_then(|lon| {
+                                                Some(format!("Longitude: {:.2}", lon).to_string())
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                        .unwrap_or(text.to_string())
+                                    });
+                                    Some(())
+                                });
+
+                                boxes.get_id_mut(id!("latitude")).and_then(|box_| {
+                                    box_.replace_text(|text| {
+                                        if infos.quality != GgaQualityIndicator::Invalid {
+                                            infos.latitude.and_then(|lat| {
+                                                Some(format!("Latitude: {:.2}", lat).to_string())
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                        .unwrap_or(text.to_string())
+                                    });
+                                    Some(())
+                                });
+
+                                boxes.get_id_mut(id!("altitude")).and_then(|box_| {
+                                    box_.replace_text(|text| {
+                                        if infos.quality != GgaQualityIndicator::Invalid {
+                                            infos.altitude.and_then(|alt| {
+                                                Some(format!("Altitude: {:.1}m", alt).to_string())
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                        .unwrap_or(text.to_string())
+                                    });
+                                    Some(())
+                                });
+                            }
+                            ParsedMessage::Rmc(infos) => {
+                                boxes.get_id_mut(id!("speed")).and_then(|box_| {
+                                    box_.replace_text(|_| {
+                                        if let Some(true) = infos.status_active {
+                                            infos.sog_knots.and_then(|sog| {
+                                                let speed = sog * 0.5144 * 3.6;
+                                                Some(format!("Vitesse au sol: {:.2}km/h", speed))
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                        .unwrap_or("Connexion".to_string())
+                                    });
+                                    Some(())
+                                });
+                            }
+                            _ => {}
+                        };
+                    }
+                    None => {
+                        boxes
+                            .get_id_mut(id!("time"))
+                            .unwrap()
+                            .set_text("Connexion...");
+                    }
+                };
             })
             .add_box(
-                GraphicBox::new(Point::new(0, 0), Size::new(WIDTH, 25))
-                    .with_text("Excursion info")
-                    .with_text_size(TextSize::Large),
+                GraphicBox::new(Point::new(0, 0), Size::new(WIDTH / 2, 40))
+                    .with_text("Connexion...")
+                    .with_text_size(TextSize::Medium)
+                    .with_id(id!("time")),
             )
-            .add_box(GraphicBox::new(Point::new(0, 50), Size::new(WIDTH, 25)));
+            .add_box(
+                GraphicBox::new(Point::new(WIDTH as i32 / 2, 0), Size::new(WIDTH / 2, 40))
+                    .with_text("Connexion...")
+                    .with_text_size(TextSize::Medium)
+                    .with_id(id!("temperature")),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(0, 40), Size::new(WIDTH / 2, 40))
+                    .with_text("Connexion...")
+                    .with_id(id!("longitude")),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(WIDTH as i32 / 2, 40), Size::new(WIDTH / 2, 40))
+                    .with_text("Connexion...")
+                    .with_id(id!("latitude")),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(0, 80), Size::new(WIDTH / 2, 40))
+                    .with_text("Connexion...")
+                    .with_id(id!("altitude")),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(WIDTH as i32 / 2, 80), Size::new(WIDTH / 2, 40))
+                    .with_text("Connexion...")
+                    .with_id(id!("speed")),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(0, 120), Size::new(WIDTH, 40))
+                    .with_text("Connexion...")
+                    .with_id(id!("humidity")),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(0, 160), Size::new(WIDTH, 40))
+                    .with_id(id!("connectionState"))
+                    .with_color(Rgb565::RED),
+            );
 
         let options_screen = Screen::new(Arc::clone(&self.state))
-            .with_btn_text(Button::C, "Retour")
-            .on(Button::C, |_, pushed, boxes, state| {
-                if pushed == false {
-                    boxes.into_iter().for_each(|box_| box_.must_draw = true);
-                    state.current_screen = ScreenId::Main;
+            .with_btn_text(Button::A, "Haut")
+            .with_btn_text(Button::B, "Bas")
+            .on_update(|_, _, boxes, state, _| {
+                match state.options.selected {
+                    0 => {
+                        boxes.get_id_mut(BoxId::ButtonC).unwrap().set_text("OK");
+                        boxes.get_id_mut(id!("info")).unwrap().set_visible(false);
+                    }
+                    1 => {
+                        boxes.get_id_mut(BoxId::ButtonC).unwrap().replace_text(|_| {
+                            if state.options.fill_on_click {
+                                "Desactiver"
+                            } else {
+                                "Activer"
+                            }
+                            .to_string()
+                        });
+                        boxes.get_id_mut(id!("fill")).unwrap().replace_text(|_| {
+                            if state.options.fill_on_click {
+                                "Actif"
+                            } else {
+                                "Inactif"
+                            }
+                            .to_string()
+                        });
+
+                        let info_box = boxes.get_id_mut(id!("info")).unwrap();
+                        info_box.set_visible(true);
+                        info_box.replace_text(|_| {
+                            "Remplissage des boutons en bas de l'ecran".to_string()
+                        });
+                    }
+                    _ => {}
+                };
+            })
+            .on(Button::A, |_, pushed, boxes, state| {
+                if state.options.selected > 0 && pushed == false {
+                    boxes
+                        .get_id_mut(id!(state.options.selected))
+                        .and_then(|el| Some(el.replace_text(|txt| txt.replace("> ", ""))));
+                    state.options.selected -= 1;
+                    boxes
+                        .get_id_mut(id!(state.options.selected))
+                        .and_then(|el| Some(el.replace_text(|txt| format!("> {}", txt))));
                 }
             })
+            .on(Button::B, |_, pushed, boxes, state| {
+                if state.options.selected < state.options.max_selected && pushed == false {
+                    boxes
+                        .get_id_mut(id!(state.options.selected))
+                        .and_then(|el| Some(el.replace_text(|txt| txt.replace("> ", ""))));
+                    state.options.selected += 1;
+                    boxes
+                        .get_id_mut(id!(state.options.selected))
+                        .and_then(|el| Some(el.replace_text(|txt| format!("> {}", txt))));
+                }
+            })
+            .on(Button::C, |_, pushed, boxes, state| {
+                if pushed == false {
+                    match state.options.selected {
+                        0 => {
+                            boxes.into_iter().for_each(|box_| box_.must_draw = true);
+                            state.current_screen = ScreenId::Main;
+                        }
+                        1 => {
+                            state.options.fill_on_click = state.options.fill_on_click == false;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .add_box(
+                GraphicBox::new(Point::new(0, 50), Size::new(WIDTH / 2, 25))
+                    .with_text("> Retour")
+                    .with_id(id!(0)),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(0, 80), Size::new(WIDTH / 2, 25))
+                    .with_text("Remplissage des boutons")
+                    .with_id(id!(1)),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(WIDTH as i32 / 2, 80), Size::new(WIDTH / 2, 25))
+                    .with_id(id!("fill"))
+                    .with_text("Inactif"),
+            )
+            .add_box(
+                GraphicBox::new(Point::new(0, HEIGHT as i32 - 60), Size::new(WIDTH, 25))
+                    .with_id(id!("info")),
+            )
             .add_box(
                 GraphicBox::new(Point::new(0, 0), Size::new(WIDTH, 25))
                     .with_text("Options")
