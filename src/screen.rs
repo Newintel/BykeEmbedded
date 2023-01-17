@@ -582,8 +582,7 @@ impl App {
             .on(Button::A, |cs, pushed, _, state| {
                 if pushed == false {
                     match state.connection.ble {
-                        BleState::Connected | BleState::Advertising => {}
-                        BleState::Disconnected => {
+                        BleState::Connected | BleState::Advertising | BleState::Disconnected => {
                             send_i2c(cs, Commands::StartBle);
                         }
                         BleState::NONE => {
@@ -622,10 +621,9 @@ impl App {
                     Commands::BleState(ble_state) => {
                         let box_a = boxes.get_id_mut(BoxId::ButtonA).unwrap();
                         match ble_state {
-                            BleState::Connected | BleState::Advertising => {
-                                box_a.set_visible(false);
-                            }
-                            BleState::Disconnected => {
+                            BleState::Connected
+                            | BleState::Advertising
+                            | BleState::Disconnected => {
                                 box_a.set_visible(true);
                                 box_a.set_text("Relancer BLE");
                             }
